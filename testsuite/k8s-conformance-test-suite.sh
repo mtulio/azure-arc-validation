@@ -18,6 +18,10 @@
 # --plugin-env azure-arc-platform.PROXY_CERT_NAMESPACE="<namespace of sonobuoy secret>"
 # --plugin-env azure-arc-agent-cleanup.PROXY_CERT_NAMESPACE="namespace of sonobuoy secret"
 
+#set -o pipefail
+# set -o nounset
+#set -o errexit
+
 # Loading variables file
 VAR_FILE=./.env-platform
 if [[ ! -f ${VAR_FILE} ]]; then
@@ -30,15 +34,18 @@ az login --service-principal --username $AZ_CLIENT_ID --password $AZ_CLIENT_SECR
 az account set -s $AZ_SUBSCRIPTION_ID
 
 declare -g sonobuoyResults
+declare -g sonobuoy_done
+
+sonobuoy_done=/tmp/sonobuoy.done
 
 DT_EXEC_TMP="$(date +%Y%m%d%H%M)"
 RESULT_DIR="./results-archive-${DT_EXEC_TMP}"
-mkdir ${RESULT_DIR}
 echo ">> Results will be saved on: ${RESULT_DIR}"
 
 # OpenShift debug only: used to collect OCP log when sonobuoy fails with EOF error
 collect_sonobuoy_results() {
     sleep 10;
+    mkdir ${RESULT_DIR}
     echo "# Finding the node running sonobuoy container"
     local node_pod=$(oc get pods -n sonobuoy sonobuoy -o jsonpath='{.spec.nodeName}')
 
@@ -60,7 +67,7 @@ collect_sonobuoy_results() {
         ls -lsha ${result_file}
         sonobuoyResults=${result_file}
 
-        echo "Extracting results..."
+        echo "Extracting results...(optional)"
         filename=$(basename -s .tar.gz $result_file)
         mkdir ${RESULT_DIR}/$filename
         tar xf ${result_file}  -C ${RESULT_DIR}/$filename plugins/azure-arc-platform/sonobuoy_results.yaml
@@ -81,8 +88,9 @@ patch_kube_aad_proxy() {
   while $(test -z $(oc -n ${ns} get deployment -l app.kubernetes.io/component=${deployment_name} -o jsonpath="{.items[*].metadata.name}"));
   do
     test ${cnt} -eq $maxRetries && return;
+    test -f "${sonobuoy_done}" && return;
     let "cnt++";
-    echo "#> running patch ${deployment_name}: $cnt / $maxRetries";
+    echo "#> Waiting for resource deployment/${deployment_name}: $cnt / $maxRetries";
     sleep $sleepInter;
   done
   sleep $sleepInter
@@ -90,7 +98,7 @@ patch_kube_aad_proxy() {
   oc \
     patch deployment.apps/${deployment_name} -n ${ns} \
     --type='json' \
-    -p='[{"op": "replace", "path": "/spec/template/spec/containers/1/securityContext", "value":{"privileged": true, "runAsGroup": 0,"runAsUser": 0}}]'
+    -p='[{"op":"replace","path":"/spec/template/spec/containers/1/securityContext","value":{"privileged":true,"runAsGroup":0,"runAsUser":0}}]'
 }
 
 patch_controller_manager() {
@@ -102,8 +110,9 @@ patch_controller_manager() {
   while $(test -z $(oc -n ${ns} get deployment -l app.kubernetes.io/component=${deployment_name} -o jsonpath="{.items[*].metadata.name}"));
   do
     test ${cnt} -eq $maxRetries && return;
+    test -f "${sonobuoy_done}" && return;
     let "cnt++";
-    echo "#> running patch ${deployment_name}: $cnt / $maxRetries";
+    echo "#> Waiting for resource deployment/${deployment_name}: $cnt / $maxRetries";
     sleep $sleepInter;
   done
   sleep $sleepInter
@@ -111,13 +120,71 @@ patch_controller_manager() {
   oc \
     patch deployment.apps/${deployment_name} -n ${ns} \
     --type='json' \
-    -p='[{"op": "replace", "path": "/spec/template/spec/containers/0/securityContext", "value":{"privileged": true}}]'
+    -p='[{"op":"replace","path":"/spec/template/spec/containers/0/securityContext","value":{"privileged":true}}]'
 }
 
-# OpenShift debug only: dump NSs
-backup_results() {
-    echo "# collecting NS dump"
-    oc adm inspect ns/sonobuoy ns/azure-arc ns/default --dest-dir=${RESULT_DIR}/ns-inspect
+wait_and_dump_cluster_data() {
+
+  local namespaces_to_test="$1"
+  local maxRetries=20
+  local sleepInter=10
+  local sleepToDump="${sleepToDump:-30}"
+  local namespaces_to_dump=""
+
+  # test/wait for NS is created
+  for ns in ${namespaces_to_test};
+  do
+    local resource=""
+    local cnt=0
+    # those NS takes about 5m after azure-arc is created. arc-k8s-demo is created before
+    # cluster-config but almost the same time.
+    if [[ "${ns}" == "arc-k8s-demo" ]]; then maxRetries=20; sleepInter=30;
+    elif [[ "${ns}" == "cluster-config" ]]; then maxRetries=20; sleepInter=30;
+    else maxRetries=5; fi
+    while $(test -z ${resource});
+    do
+      resource=$(oc get ns ${ns} -o jsonpath="{.metadata.name}" 2>/dev/null)
+      test ${cnt} -eq $maxRetries && break;
+      test -f "${sonobuoy_done}" && break;
+      let "cnt++";
+      echo "#> Waiting for resource ns/${ns}: $cnt / $maxRetries . CurResults=[${resource}]";
+      sleep $sleepInter;
+    done
+    # if [[ ! -z ${resource} ]]; then
+    # forcing dump all
+    #namespaces_to_dump+=" ns/${resource}"
+    # fi
+    test -f "${sonobuoy_done}" && break;
+  done
+
+  for ns in ${namespaces_to_test}; do namespaces_to_dump+=" ns/${ns}"; done
+  # if [[ -z ${namespaces_to_dump} ]]; then
+  #   echo "#> dump: not NS was found to dump [${namespaces_to_dump} ], filling it."
+  #   #return
+  # fi
+  sleep $sleepToDump
+
+  dump_dir=./inspect.local-${dump_name}-${DT_EXEC_TMP}-${arc_platform_version}
+  oc adm inspect \
+    --dest-dir=${dump_dir} \
+    ${namespaces_to_dump}
+  echo "Cleaning CLIENT_SECRET from dump..."
+  grep -rl $AZ_CLIENT_SECRET ${dump_dir}
+  grep -rl $AZ_CLIENT_SECRET ${dump_dir} |xargs sed -i "s/${AZ_CLIENT_SECRET}/[REDACTED]/g"
+}
+
+wait_and_dump_cluster_data_base() {
+  local namespaces="default sonobuoy azure-arc"
+  local dump_name="base"
+  local sleepToDump=120
+  wait_and_dump_cluster_data "${namespaces}" 
+}
+
+wait_and_dump_cluster_data_app() {
+  local namespaces="cluster-config arc-k8s-demo"
+  local dump_name="app"
+  local sleepToDump=30
+  wait_and_dump_cluster_data "${namespaces}"
 }
 
 # OpenShift debug only: check if provider was created
@@ -157,26 +224,44 @@ clean_up_resources() {
     az_provider_show
 
     #> Delete
-    for arc_name in $(az connectedk8s list  --resource-group $RESOURCE_GROUP  -o json |jq -r .[].name); do
-        echo "#> Sending delete command for 'az connectedk8s' for resource ${arc_name}"
-        az connectedk8s delete --yes --name $arc_name --resource-group $RESOURCE_GROUP ;
-    done
+    # for arc_name in $(az connectedk8s list  --resource-group $RESOURCE_GROUP  -o json |jq -r .[].name); do
+    #     echo "#> Sending delete command for 'az connectedk8s' for resource ${arc_name}"
+    #     az connectedk8s delete --yes --name $arc_name --resource-group $RESOURCE_GROUP ;
+    # done
 
-    echo "Sleeping a while to start the process..."
+    echo "Sleeping a while after delete process..."
     sleep 30;
 }
 clean_up_resources
 
 # run the test for each varsion
-while IFS= read -r arc_platform_version || [ -n "$arc_platform_version" ]; do
+first_job=true
+while read arc_platform_version; do
 
-    echo "Running the test suite for Arc for Kubernetes version: ${arc_platform_version}"    
+    if [[ -z $arc_platform_version ]]; then
+      # some issues when runing empty lines
+      echo "Detect empty version of arc_platform_version, turn down the process"
+      break
+    fi
+
+    if [[ $first_job != true ]]; then
+      # always wait 5m to the next job, not in the last one ;)
+      echo "Buffer wait 5 minutes to run the next version[$arc_platform_version]..."
+      sleep 5m
+    fi
+    first_job=false
+    echo -e "\n\n>> Running the test suite for Arc for Kubernetes version: ${arc_platform_version}"
 
     #> Patch to make sure SCC has the less restrictive permissions to run Arc Validation
     #>> removing it for a while to test it in newer versions:
     #>> arck8sconformance.azurecr.io/arck8sconformance/clusterconnect:0.1.7
+    #sonobuoy_done=false
+    rm -f "${sonobuoy_done}"
     patch_kube_aad_proxy &
     patch_controller_manager &
+
+    wait_and_dump_cluster_data_base &
+    wait_and_dump_cluster_data_app &
 
     sonobuoy run --wait \
     --plugin arc-k8s-platform/platform.yaml \
@@ -201,13 +286,12 @@ while IFS= read -r arc_platform_version || [ -n "$arc_platform_version" ]; do
     --dns-namespace="${DNS_NAMESPACE}" \
     --dns-pod-labels="${DNS_POD_LABELS}"
 
+    touch "${sonobuoy_done}"
+    sleep 30
     echo "Test execution completed..Retrieving results"
 
     sonobuoyResults=$(sonobuoy retrieve)
     sonobuoy results $sonobuoyResults
-
-    # mkdir ${RESULT_DIR}/testResult-$arc_platform_version
-    # python arc-k8s-platform/remove-secrets.py $sonobuoyResults ${RESULT_DIR}/testResult-$arc_platform_version
 
     #>>>> Patch to remove secretes starts here
     # OpenShift collector when 'sonobuoy retrieve' fails with 'EOF'
@@ -218,13 +302,13 @@ while IFS= read -r arc_platform_version || [ -n "$arc_platform_version" ]; do
     cp -v $sonobuoyResults "${res_filename}-bkp.tar.gz"
 
     # clean secrets (1): the original file will be overrided
-    res_tmp="${RESULT_DIR}/testResult-$arc_platform_version"
+    res_tmp="./testResult"
     mkdir -p ${res_tmp}
-    python arc-k8s-platform/remove-secrets.py $sonobuoyResults ${res_tmp}
+    python ../arc-k8s-platform/remove-secrets.py $sonobuoyResults ${res_tmp}
     rm -rf ${res_tmp}
 
     # clean secret (2)
-    res_tmp="${RESULT_DIR}/.tmp-testResult-$arc_platform_version"
+    res_tmp="./testResult"
     mkdir -p ${res_tmp}
     tar xfz $sonobuoyResults -C ${res_tmp}
     echo "# Reporting files with credential AZ_CLIENT_SECRET: "
@@ -233,48 +317,53 @@ while IFS= read -r arc_platform_version || [ -n "$arc_platform_version" ]; do
     echo "# Redacting credential AZ_CLIENT_SECRET: "
     grep -rl $AZ_CLIENT_SECRET ${res_tmp} |xargs sed -i "s/${AZ_CLIENT_SECRET}/[REDACTED]/g"
 
-    # copy partner metadata
-    cp partner-metadata.md ${res_tmp}/partner-metadata.md
-
+    rm -vf $sonobuoyResults
     res_cwd=$PWD
     pushd ${res_tmp}
-    tar cfJ "${res_cwd}/${res_filename}-redacted.tar.xz" *
+    # Will be the new $sonobuoyResults
+    tar cfz "${res_cwd}/$sonobuoyResults" *
     popd
     rm -rf ${res_tmp}
-    mv -v ${res_cwd}/${res_filename}* ${RESULT_DIR}
+    #mv -v ${res_cwd}/${res_filename}* ${RESULT_DIR}
 
     #>>>> Patch to remove secretes ends here
 
-    # #rm -rf testResult-$arc_platform_version
-    # RESULTS_NAME="results-$arc_platform_version"
-    # mkdir ${RESULT_DIR}/${RESULTS_NAME}
-    # mv $sonobuoyResults ${RESULT_DIR}/${RESULTS_NAME}/$sonobuoyResults
-    # cp partner-metadata.md ${RESULT_DIR}/${RESULTS_NAME}/partner-metadata.md
-    # tar -czvf conformance-${RESULTS_NAME}.tar.gz ${RESULT_DIR}/${RESULTS_NAME}
-    #rm -rf ${RESULTS_PATH}/${RESULTS_NAME}
+    # from original:
+    mkdir results
+    mv $sonobuoyResults results/$sonobuoyResults
+    cp partner-metadata.md results/partner-metadata.md
+    tar -czvf conformance-results-$arc_platform_version.tar.gz results
+    rm -rf results
 
-    echo "Publishing results... (ignoring for now)"
-    # IFS='.'
-    # read -ra version <<< $arc_platform_version
-    # containerString="${DT_EXEC_TMP}-conformance-results-major-${version[0]}-minor-${version[1]}-patch-${version[2]}"
-    # IFS=$' \t\n'
+    echo "Publishing results.."
 
-    #az storage container create -n $containerString --account-name $AZ_STORAGE_ACCOUNT --sas-token $AZ_STORAGE_ACCOUNT_SAS
-    #az storage blob upload --file conformance-${RESULTS_DIR}.tar.gz --name conformance-results-$OFFERING_NAME.tar.gz --container-name $containerString --account-name $AZ_STORAGE_ACCOUNT --sas-token $AZ_STORAGE_ACCOUNT_SAS
+    IFS='.'
+    read -ra version <<< $arc_platform_version
+    containerString="conformance-results-major-${version[0]}-minor-${version[1]}-patch-${version[2]}"
+    IFS=$' \t\n'
 
-    # test $(az storage account check-name -n $AZ_STORAGE_ACCOUNT |jq .nameAvailable) && \
-    #     az storage account create -n $AZ_STORAGE_ACCOUNT -g ${RESOURCE_GROUP}
-    # az storage container create -n $containerString --account-name $AZ_STORAGE_ACCOUNT -g ${RESOURCE_GROUP}
-    # az storage blob upload --file conformance-${RESULTS_DIR}.tar.gz --name conformance-results-$OFFERING_NAME.tar.gz --container-name $containerString --account-name $AZ_STORAGE_ACCOUNT
+    mkdir ${containerString}
+    cp -vf conformance-results-$arc_platform_version.tar.gz ${containerString}/conformance-results-$OFFERING_NAME.tar.gz
+
+    az storage container create \
+        -n $containerString \
+        --account-name $AZ_STORAGE_ACCOUNT \
+        --sas-token $AZ_STORAGE_ACCOUNT_SAS
+    az storage blob upload \
+       --file conformance-results-$arc_platform_version.tar.gz \
+       --name conformance-results-$OFFERING_NAME.tar.gz \
+       --container-name $containerString \
+       --account-name $AZ_STORAGE_ACCOUNT \
+       --sas-token $AZ_STORAGE_ACCOUNT_SAS
 
     echo "Cleaning the cluster... (ignoring for now)"
-    #clean_up_resources
-
-    echo "Buffer wait 5 minutes..."
-    #sleep 5m
+    clean_up_resources
 
 done < aak8sSupportPolicy.txt
 
-pushd $RESULT_DIR
-tar cf ${RESULT_DIR}.tar *-redacted.tar.xz
-popd
+echo "#> The results was upload to Blob storage and saved locally to this path: ./conformance-results-*"
+for res_dir in $(ls -d conformance-results-*/);
+do
+    echo "#>> listing dir ${res_dir}:"
+    ls -l ${res_dir}/
+done
