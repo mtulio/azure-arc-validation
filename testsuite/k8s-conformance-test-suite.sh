@@ -42,6 +42,17 @@ DT_EXEC_TMP="$(date +%Y%m%d%H%M)"
 RESULT_DIR="./results-archive-${DT_EXEC_TMP}"
 echo ">> Results will be saved on: ${RESULT_DIR}"
 
+
+cat << EOF > ./partner-metadata.md
+- Upstream Kubernetes Version: ${K8S_VERSION}
+- K8s Distribution Version: ${K8S_DISTRO_VERSION}
+- Additional Storage/Network Driver details (if applicable):
+- Private Cloud details (if applicable):
+- Bare-metal Node details (if applicable):
+- OEM/IHV solution details (if applicable):
+EOF
+
+
 # OpenShift debug only: used to collect OCP log when sonobuoy fails with EOF error
 collect_sonobuoy_results() {
     sleep 10;
